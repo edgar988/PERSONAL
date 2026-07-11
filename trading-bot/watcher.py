@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 # Load .env (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID) if python-dotenv is installed.
@@ -106,6 +107,13 @@ def _send_buy_detail(s) -> None:
 
 def _update_state(state, signals) -> None:
     state["verdicts"] = {s.ticker: s.verdict for s in signals}
+    state["snapshot"] = {
+        s.ticker: {"price": round(s.price, 2),
+                   "rsi": round(s.rsi),
+                   "chg": round(s.day_change_pct, 2)}
+        for s in signals
+    }
+    state["updated"] = time.time()
     _save_state(state)
 
 
