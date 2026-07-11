@@ -36,9 +36,13 @@ echo "==> Scheduling the Watcher..."
 #  * digest -- once daily after the close (21:30 UTC), the full board
 SCAN_LINE="*/30 13-20 * * 1-5 cd $BOT_DIR && $VENV_DIR/bin/python watcher.py scan >> $BOT_DIR/watcher.log 2>&1"
 DIGEST_LINE="30 21 * * 1-5 cd $BOT_DIR && $VENV_DIR/bin/python watcher.py >> $BOT_DIR/watcher.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'trading-bot.*watcher.py' ; echo "$SCAN_LINE" ; echo "$DIGEST_LINE" ) | crontab -
+# NB: `|| true` guards -- on a fresh server the crontab is empty, which makes
+# `crontab -l` and `grep -v` return non-zero; without the guards, pipefail
+# aborts the whole script right here (silently -- before the Telegram test).
+EXISTING="$(crontab -l 2>/dev/null | grep -v 'trading-bot.*watcher.py' || true)"
+{ [ -n "$EXISTING" ] && printf '%s\n' "$EXISTING"; echo "$SCAN_LINE"; echo "$DIGEST_LINE"; } | crontab -
 echo "Cron installed:"
-crontab -l | grep watcher.py
+crontab -l | grep watcher.py || true
 
 echo
 echo "==> Sending a Telegram self-test..."
