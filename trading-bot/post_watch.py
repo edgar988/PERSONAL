@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-POST WATCH -- send the bot a social post (Instagram link, caption text, or
+POST WATCH v2 -- send the bot a social post (Instagram link, caption text, or
 plain $TICKERs) in Telegram and it:
 
   1. Tries to read the post (Instagram blocks robots often -- if so it asks
      you to paste the caption).
-  2. Extracts and validates the stock tickers mentioned.
-  3. Replies with an instant read: price, trend vs the 50-day average, RSI,
-     and the same verdict logic the watcher uses.
-  4. Tracks each ticker for 7 days from the post, sending daily follow-ups
-     showing how the "tip" actually performed. (Great influencer BS-detector.)
+  2. AI CONTEXT READ (if ANTHROPIC_API_KEY is set): Claude reads the whole
+     post -- identifying companies even when no ticker is named ("the company
+     making cooling systems for Nvidia's data centers" -> VRT), judging the
+     post's stance per stock, and flagging hype/pressure tactics.
+  3. Falls back to plain ticker-pattern matching when no AI key is set or
+     the API call fails.
+  4. Validates every candidate against real market data, replies with an
+     instant read (price, trend, RSI, verdict), and tracks each ticker for
+     7 days with daily follow-ups. (Great influencer BS-detector.)
 
 Run `python post_watch.py followup` daily via cron for the follow-ups.
 """
@@ -41,9 +45,9 @@ BROWSER_UA = {"User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like "
 WATCH_DAYS = 7
 MAX_TICKERS = 6
 
-# words that look like tickers but aren't
+# words that look like tickers but aren't (regex-fallback path)
 _BLACKLIST = {
-    "THE", "AND", "FOR", "YOU", "ALL", "NEW", "NOW", "BUY", "SELL", "HOLD",
+    "THE", "AND", "FOR", "YOU", "ALL", "NEW", "BUY", "SELL", "HOLD",
     "THIS", "WITH", "JUST", "LIKE", "GET", "ONE", "TOP", "CEO", "IPO", "USA",
     "USD", "AI", "DM", "PM", "EPS", "YOY", "ATH", "IMO", "DD", "YOLO", "LFG",
     "WSB", "NOT", "ARE", "CAN", "HAS", "WAS", "OUT", "BIG", "HOT", "SO", "IT",
@@ -89,8 +93,62 @@ def fetch_caption(url: str):
         return None
 
 
+def ai_read_post(text: str):
+    """Claude reads the post in context. Returns a parsed PostRead or None.
+
+    Identifies stocks the post is ABOUT -- explicit tickers AND companies
+    implied by description -- plus per-stock stance and hype red flags.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic
+        from pydantic import BaseModel
+    except ImportError:
+        print("[postwatch] anthropic/pydantic not installed -- regex fallback")
+        return None
+
+    class StockRead(BaseModel):
+        ticker: str      # primary US ticker, e.g. VRT
+        company: str     # company name
+        why: str         # one sentence: how the post points at this stock
+        stance: str      # "bullish" | "bearish" | "neutral"
+
+    class PostRead(BaseModel):
+        stocks: list[StockRead]
+        summary: str         # one-sentence plain-language summary of the post
+        hype_level: str      # "low" | "medium" | "high"
+        red_flags: list[str]  # pressure tactics, guarantees, urgency, etc.
+
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.parse(
+            model="claude-opus-4-8",
+            max_tokens=2000,
+            system=(
+                "You analyze social-media posts about investing for a retail "
+                "investor who wants the truth, not hype. Identify every "
+                "publicly traded US stock the post is actually about: tickers "
+                "named explicitly AND companies only implied by description "
+                "(e.g. 'the company making cooling systems for Nvidia data "
+                "centers' implies Vertiv, ticker VRT). Use each company's "
+                "primary US ticker. Judge the post's stance per stock. Rate "
+                "hype_level high when you see pressure tactics, urgency, "
+                "guaranteed-return language, or signs of undisclosed "
+                "promotion, and list those as red_flags. If the post is not "
+                "about specific stocks, return an empty stocks list."
+            ),
+            messages=[{"role": "user", "content": f"Post:\n{text[:4000]}"}],
+            output_format=PostRead,
+        )
+        return resp.parsed_output
+    except Exception as e:
+        print(f"[postwatch] AI read failed: {e}")
+        return None
+
+
 def extract_candidates(text: str) -> list:
-    """$TAGS first (high confidence), then bare ALL-CAPS words."""
+    """Regex fallback: $TAGS first (high confidence), then ALL-CAPS words."""
     cands, seen = [], set()
     for m in re.findall(r"\$([A-Za-z]{1,5})\b", text):
         tk = m.upper()
@@ -123,17 +181,40 @@ def handle_message(text: str, say) -> None:
         if caption is None:
             blocked_note = ("⚠️ Instagram wouldn't let me read the post "
                             "(they block robots). I used the text of your "
-                            "message instead -- paste the caption or type "
-                            "the tickers (like $NVDA) if I missed any.\n\n")
+                            "message instead -- paste the caption text for "
+                            "a full context read.\n\n")
 
-    search_text = f"{caption or ''} {text}"
-    cands = extract_candidates(search_text)
+    search_text = f"{caption or ''}\n{text}".strip()
+
+    # -- AI context read (preferred) --
+    ai = ai_read_post(search_text)
+    ai_info = {}          # ticker -> StockRead
+    cands = []
+    if ai is not None:
+        for s in ai.stocks:
+            tk = s.ticker.upper().strip()
+            if tk and tk not in ai_info:
+                ai_info[tk] = s
+                cands.append(tk)
+
+    # -- regex fallback / supplement --
+    for tk in extract_candidates(search_text):
+        if tk not in cands:
+            cands.append(tk)
+
     if not cands:
-        say(blocked_note +
-            "I couldn't find any stock tickers. Paste the post's caption "
-            "text, or type them like: $NVDA $CLF")
+        if ai is not None and ai.summary:
+            say(blocked_note +
+                f"\U0001F4F1 <b>Post check</b>\n\n<i>{ai.summary}</i>\n\n"
+                "I couldn't tie this post to any specific stock. If you "
+                "think it points at one, tell me the name or ticker.")
+        else:
+            say(blocked_note +
+                "I couldn't find any stock tickers. Paste the post's caption "
+                "text, or type them like: $NVDA $CLF")
         return
 
+    # -- validate against real market data --
     sigs = []
     for tk in cands:
         s = analyze(tk)
@@ -148,17 +229,34 @@ def handle_message(text: str, say) -> None:
             "like $NVDA.")
         return
 
+    # -- compose the reply --
     lines = [blocked_note + "\U0001F4F1 <b>Post check</b>", ""]
-    if caption:
+    if ai is not None:
+        lines.append(f"<i>{ai.summary}</i>")
+        hype_icon = {"low": "\U0001F7E2", "medium": "\U0001F7E1",
+                     "high": "\U0001F534"}.get(ai.hype_level, "⚪")
+        lines.append(f"Hype level: {hype_icon} <b>{ai.hype_level}</b>")
+        if ai.red_flags:
+            lines.append("⚠️ <b>Red flags:</b> " + "; ".join(ai.red_flags[:4]))
+        lines.append("")
+    elif caption:
         lines.append(f"<i>“{caption[:180]}”</i>")
         lines.append("")
+
     for s in sigs:
         trend = "uptrend" if s.price > s.sma_slow else "downtrend"
         icon = {"BUY_WATCH": "\U0001F7E2", "OVERBOUGHT": "\U0001F534",
                 "NEUTRAL": "⚪"}[s.verdict]
-        lines.append(f"{icon} <b>{s.ticker}</b> ${s.price:.2f} "
-                     f"({s.day_change_pct:+.1f}% today) -- {trend}, "
-                     f"RSI {s.rsi:.0f}, verdict: {s.verdict}")
+        line = (f"{icon} <b>{s.ticker}</b> ${s.price:.2f} "
+                f"({s.day_change_pct:+.1f}% today) -- {trend}, "
+                f"RSI {s.rsi:.0f}, verdict: {s.verdict}")
+        lines.append(line)
+        info = ai_info.get(s.ticker)
+        if info is not None:
+            stance_icon = {"bullish": "\U0001F4C8", "bearish": "\U0001F4C9",
+                           "neutral": "➖"}.get(info.stance, "➖")
+            lines.append(f"   {stance_icon} Post is <b>{info.stance}</b>: "
+                         f"{info.why}")
     lines.append("")
     lines.append(f"\U0001F440 I'll track these for {WATCH_DAYS} days and "
                  "report how the post's picks actually perform.")
