@@ -10,12 +10,16 @@ Stage 2 -- APPROVE-FIRST EXECUTOR (long-running service).
   day's start, new buys halt until the next day (or /resume).
 * Stop-loss watchdog: any position down STOP_LOSS_PCT from its average
   cost triggers a SELL proposal (once per ticker per day).
-* Commands: /status /positions /halt /resume /sell TICKER /help
+* Plain messages (not starting with /) are treated as POST-WATCH requests:
+  send an Instagram link, a post caption, or $TICKERs and the bot analyzes
+  the stocks mentioned and tracks them for 7 days.
+* Commands: /status /positions /halt /resume /sell TICKER /watching /help
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -31,6 +35,7 @@ import requests
 
 import broker
 import config
+import post_watch
 import proposals
 import risk
 
@@ -186,12 +191,23 @@ def on_callback(cb: dict, st: dict) -> None:
             _edit(mid, f"⚠️ <b>Order FAILED:</b> {detail}")
 
 
-def on_command(msg: dict, st: dict) -> None:
+def on_message(msg: dict, st: dict) -> None:
     if str(msg.get("from", {}).get("id")) != CHAT_ID:
         return
     text = (msg.get("text") or "").strip()
-    if not text.startswith("/"):
+    if not text:
         return
+
+    # Plain message (no /command) -> post-watch: IG links, captions, $tickers
+    if not text.startswith("/"):
+        if re.search(r"https?://", text) or re.search(r"\$?[A-Za-z]{1,5}", text):
+            try:
+                post_watch.handle_message(text, say)
+            except Exception as e:
+                traceback.print_exc()
+                say(f"⚠️ Post-watch hit an error: {e}")
+        return
+
     cmd, *args = text.split()
     cmd = cmd.lower()
 
@@ -241,6 +257,9 @@ def on_command(msg: dict, st: dict) -> None:
         st["halt_reason"] = ""
         say("▶️ Resumed. Buys allowed again, caps still enforced.")
 
+    elif cmd == "/watching":
+        say(post_watch.status_text())
+
     elif cmd == "/sell" and args:
         tk = args[0].upper()
         try:
@@ -260,7 +279,10 @@ def on_command(msg: dict, st: dict) -> None:
         say("Commands:\n/status -- equity, P&L, halt state\n"
             "/positions -- open positions\n"
             "/sell TICKER -- propose selling a position\n"
-            "/halt /resume -- stop/allow new buys")
+            "/watching -- active post watches\n"
+            "/halt /resume -- stop/allow new buys\n\n"
+            "Or just send an Instagram link, a post caption, or $TICKERs "
+            "and I'll analyze + track the stocks mentioned.")
 
 
 def periodic(st: dict) -> None:
@@ -336,9 +358,9 @@ def main() -> None:
         sys.exit(str(e))
 
     st = _load_state()
-    say("\U0001F916 <b>Approver online -- Stage 2 active.</b>\n"
-        "Trade proposals now arrive with ✅/❌ buttons. "
-        "Nothing executes without your tap.\n/help for commands.")
+    say("\U0001F916 <b>Approver online.</b>\n"
+        "✅/❌ proposals, /help for commands -- or send an Instagram "
+        "link / $TICKERs to analyze a post.")
     last_periodic = 0.0
 
     while True:
@@ -381,7 +403,7 @@ def main() -> None:
                 if "callback_query" in u:
                     on_callback(u["callback_query"], st)
                 elif "message" in u:
-                    on_command(u["message"], st)
+                    on_message(u["message"], st)
             _save_state(st)
         except KeyboardInterrupt:
             raise
