@@ -20,4 +20,3 @@ rh.login(username, password, store_session=True)
 bp = rh.profiles.load_account_profile(info="buying_power")
 print(f"\nLogin OK. Buying power: ${bp}")
 print("Session stored. The approver bot and dashboard can now trade headlessly.")
-""""""

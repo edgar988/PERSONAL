@@ -2,7 +2,7 @@
 """
 Stage 1 -- THE WATCHER.
 
-Two modes, both cron-friendly and both place ZERO trades:
+Two modes, both cron-friendly:
 
   python watcher.py           Full digest -- every ticker, sent every time.
                               Run once daily after market close.
@@ -15,6 +15,11 @@ Two modes, both cron-friendly and both place ZERO trades:
                               Otherwise: total silence.
 
   python watcher.py test      Telegram self-test.
+
+Stage 2 integration: every fresh BUY_WATCH also lands in the proposal queue.
+If the approver bot is running, it follows up with ✅/❌ buttons; nothing is
+placed without a tap. If the approver bot is NOT running, the queue entry
+just sits there and expires -- the Watcher itself never trades.
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ except ImportError:
 import config
 import data
 import notify
+import proposals
 from strategy import evaluate
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
@@ -76,6 +82,15 @@ def _fresh_buys(signals, state):
             and state["verdicts"].get(s.ticker) != "BUY_WATCH"]
 
 
+def _queue_for_approval(s) -> None:
+    """Stage 2 hand-off: put the signal in the proposal queue."""
+    try:
+        proposals.enqueue_buy(s.ticker, s.price,
+                              config.MAX_PER_POSITION_USD, s.reasons)
+    except Exception as e:  # queueing must never break the watcher
+        print(f"[watcher] could not enqueue {s.ticker}: {e}")
+
+
 def _send_buy_detail(s) -> None:
     detail = [f"\U0001F7E2 <b>{s.ticker}</b> -- buy-watch triggered",
               f"Price: ${s.price:.2f}",
@@ -84,8 +99,8 @@ def _send_buy_detail(s) -> None:
               "", "<b>Why:</b>"]
     detail += [f"* {r}" for r in s.reasons]
     detail.append("")
-    detail.append("<i>Watcher only -- no order placed. This is a heads-up "
-                  "to research the name.</i>")
+    detail.append("<i>If the approver is running, a ✅/❌ proposal follows. "
+                  "No order is placed without your tap.</i>")
     notify.send("\n".join(detail))
 
 
@@ -109,7 +124,7 @@ def digest() -> None:
     over = [s for s in signals if s.verdict == "OVERBOUGHT"]
 
     lines = [f"<b>\U0001F4CA Watcher digest -- {now}</b>",
-             "<i>Stage 1: signals only, no trades placed.</i>", ""]
+             "<i>Signals below; orders only happen via ✅ approval.</i>", ""]
     if fresh:
         lines.append("<b>\U0001F195 NEW buy-watch signals:</b>")
         for s in fresh:
@@ -129,6 +144,7 @@ def digest() -> None:
 
     for s in fresh:
         _send_buy_detail(s)
+        _queue_for_approval(s)
 
     _update_state(state, signals)
     print(f"[watcher] digest: {len(signals)} tickers, {len(fresh)} fresh buys.")
@@ -152,6 +168,7 @@ def scan() -> None:
 
     for s in fresh:
         _send_buy_detail(s)
+        _queue_for_approval(s)
 
     if movers:
         lines = ["<b>⚡ Big intraday moves:</b>"]
