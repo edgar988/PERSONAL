@@ -51,3 +51,9 @@ RSI_OVERSOLD   = 35   # below this = beaten down; a cross back up = potential en
 RSI_OVERBOUGHT = 70   # above this = stretched; caution / take-profit zone
 LOOKBACK_DAYS     = 200  # how much price history to pull for the math
 CROSS_RECENT_DAYS = 3    # a crossover counts as "fresh" if within this many days
+
+# -- Intraday scan -----------------------------------------------------------
+# The `scan` mode runs every 30 min during market hours and stays SILENT
+# unless something changed. A big intraday move (vs yesterday's close)
+# triggers a one-time alert per ticker per day.
+BIG_MOVE_PCT = 3.0   # alert when a ticker is up/down this % on the day

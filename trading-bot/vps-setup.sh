@@ -30,9 +30,13 @@ if grep -q "your-bot-token-here" "$BOT_DIR/.env"; then
 fi
 chmod 600 "$BOT_DIR/.env"
 
-echo "==> Scheduling the Watcher (weekdays 21:30 UTC = 4:30pm ET market close)..."
-CRON_LINE="30 21 * * 1-5 cd $BOT_DIR && $VENV_DIR/bin/python watcher.py >> $BOT_DIR/watcher.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'trading-bot.*watcher.py' ; echo "$CRON_LINE" ) | crontab -
+echo "==> Scheduling the Watcher..."
+#  * scan  -- every 30 min during US market hours (13:30-20:00 UTC covers
+#             9:30am-4pm ET during daylight saving; quiet unless news)
+#  * digest -- once daily after the close (21:30 UTC), the full board
+SCAN_LINE="*/30 13-20 * * 1-5 cd $BOT_DIR && $VENV_DIR/bin/python watcher.py scan >> $BOT_DIR/watcher.log 2>&1"
+DIGEST_LINE="30 21 * * 1-5 cd $BOT_DIR && $VENV_DIR/bin/python watcher.py >> $BOT_DIR/watcher.log 2>&1"
+( crontab -l 2>/dev/null | grep -v 'trading-bot.*watcher.py' ; echo "$SCAN_LINE" ; echo "$DIGEST_LINE" ) | crontab -
 echo "Cron installed:"
 crontab -l | grep watcher.py
 
@@ -46,6 +50,7 @@ echo "==> Running the Watcher once right now (full digest)..."
 "$VENV_DIR/bin/python" watcher.py
 
 echo
-echo "All set. The Watcher will now text you every weekday after market close."
+echo "All set:"
+echo "  * Intraday scan every 30 min during market hours (silent unless something changes)"
+echo "  * Full digest every weekday after the close"
 echo "Log file: $BOT_DIR/watcher.log"
-"$VENV_DIR/bin/python" -c 'print()' 2>/dev/null || true

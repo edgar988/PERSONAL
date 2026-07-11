@@ -12,7 +12,7 @@ Nothing here is a black box:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -23,11 +23,19 @@ import config
 class Signal:
     ticker: str
     price: float
+    prev_close: float
     sma_fast: float
     sma_slow: float
     rsi: float
     verdict: str        # "BUY_WATCH" | "OVERBOUGHT" | "NEUTRAL"
-    reasons: list
+    reasons: list = field(default_factory=list)
+
+    @property
+    def day_change_pct(self) -> float:
+        """Percent move vs the prior close (intraday move detector)."""
+        if self.prev_close <= 0:
+            return 0.0
+        return (self.price - self.prev_close) / self.prev_close * 100.0
 
 
 def _rsi(close: pd.Series, period: int) -> pd.Series:
@@ -49,6 +57,7 @@ def evaluate(ticker: str, df):
     rsi = _rsi(close, config.RSI_PERIOD)
 
     price = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2])
     f = float(sma_fast.iloc[-1])
     s = float(sma_slow.iloc[-1])
     r = float(rsi.iloc[-1])
@@ -101,4 +110,4 @@ def evaluate(ticker: str, df):
     else:
         verdict = "NEUTRAL"
 
-    return Signal(ticker, price, f, s, r, verdict, reasons)
+    return Signal(ticker, price, prev_close, f, s, r, verdict, reasons)
