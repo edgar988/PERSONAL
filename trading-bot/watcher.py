@@ -6,14 +6,23 @@ Runs once per invocation (cron-friendly): pulls prices for every ticker in
 the watchlist, evaluates the swing-trading rules, and sends you a Telegram
 digest. It PLACES NO TRADES. Nothing here can touch your Robinhood account.
 
-Run it:   python watcher.py
+Run it:        python watcher.py
+Self-test:     python watcher.py test     (just sends a Telegram test message)
 Schedule it (Linux/VPS): see README.md -> cron
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
+
+# Load .env (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID) if python-dotenv is installed.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass
 
 import config
 import data
@@ -106,4 +115,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        notify.send("✅ Telegram test from the trading bot Watcher. "
+                    "Notifications are working.")
+    else:
+        main()
