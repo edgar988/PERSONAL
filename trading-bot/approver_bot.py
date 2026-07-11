@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Stage 2 -- APPROVE-FIRST EXECUTOR (long-running service).
+APPROVE-FIRST EXECUTOR (long-running service).
 
-* Watches the proposal queue; sends each proposal to Telegram with
-  ✅ Approve / ❌ Deny buttons. NOTHING executes without a tap.
-* Re-checks the risk caps at execution time (config.py: per-position,
-  total-deployed).
-* Daily loss stop: if account equity drops $DAILY_LOSS_STOP_USD below the
-  day's start, new buys halt until the next day (or /resume).
-* Stop-loss watchdog: any position down STOP_LOSS_PCT from its average
-  cost triggers a SELL proposal (once per ticker per day).
-* Plain messages (not starting with /) are treated as POST-WATCH requests:
-  send an Instagram link, a post caption, or $TICKERs and the bot analyzes
-  the stocks mentioned and tracks them for 7 days.
+* Proposal queue -> Telegram with ✅/❌ buttons. NOTHING executes without a tap.
+* Risk caps re-checked at execution time (per-position, total, theme).
+* Daily loss stop: equity down $DAILY_LOSS_STOP_USD from the day's start ->
+  buys halt until tomorrow (or /resume).
+* TRAILING STOP: any position down STOP_LOSS_PCT from its PEAK price ->
+  sell proposal. Protects gains, not just principal.
+* TAKE PROFIT: position up TAKE_PROFIT_PCT from avg cost -> proposal to
+  sell half (lock gains, let the rest ride).
+* Plain messages (no /) = post-watch: send IG links, captions, or $TICKERs.
 * Commands: /status /positions /halt /resume /sell TICKER /watching /help
 """
 from __future__ import annotations
@@ -61,6 +59,8 @@ def _load_state() -> dict:
     st.setdefault("day", None)
     st.setdefault("day_start_equity", None)
     st.setdefault("stoploss_proposed", {})
+    st.setdefault("tp_proposed", {})
+    st.setdefault("peaks", {})   # ticker -> high-water price since entry
     return st
 
 
@@ -151,7 +151,6 @@ def on_callback(cb: dict, st: dict) -> None:
         tg("answerCallbackQuery", callback_query_id=cb["id"], text="Denied.")
         return
 
-    # APPROVE -- re-run risk checks against live holdings, then execute.
     tg("answerCallbackQuery", callback_query_id=cb["id"], text="Placing order...")
     try:
         live_holdings = broker.holdings()
@@ -221,9 +220,12 @@ def on_message(msg: dict, st: dict) -> None:
                 f"Equity: ${eq:,.2f} ({'+' if pnl >= 0 else ''}{pnl:,.2f} today)\n"
                 f"Buying power: ${bp:,.2f}\n"
                 f"Halted: {'YES -- ' + st['halt_reason'] if st['halted'] else 'no'}\n"
-                f"Caps: ${config.MAX_PER_POSITION_USD}/position, "
+                f"Caps: ${config.MAX_PER_POSITION_USD}/position (ATR-scaled), "
                 f"${config.MAX_TOTAL_DEPLOYED_USD} total, "
-                f"${config.DAILY_LOSS_STOP_USD} daily stop")
+                f"{int(config.THEME_MAX_FRACTION*100)}% AI-theme cap, "
+                f"${config.DAILY_LOSS_STOP_USD} daily stop, "
+                f"{int(config.STOP_LOSS_PCT*100)}% trailing stop, "
+                f"+{int(config.TAKE_PROFIT_PCT*100)}% take-profit")
         except Exception as e:
             say(f"⚠️ Robinhood unreachable: {e}")
 
@@ -239,10 +241,13 @@ def on_message(msg: dict, st: dict) -> None:
         lines = ["\U0001F4BC <b>Positions</b>"]
         for tk, h in hs.items():
             try:
+                peak = st["peaks"].get(tk)
+                peak_note = f" (peak ${float(peak):.2f})" if peak else ""
                 lines.append(
                     f"{tk}: {float(h['quantity']):g} sh @ "
                     f"${float(h['average_buy_price']):.2f} avg -> "
-                    f"${float(h['equity']):.2f} ({h['percent_change']}%)")
+                    f"${float(h['equity']):.2f} ({h['percent_change']}%)"
+                    f"{peak_note}")
             except (KeyError, TypeError, ValueError):
                 lines.append(f"{tk}: (parse error)")
         say("\n".join(lines))
@@ -277,7 +282,7 @@ def on_message(msg: dict, st: dict) -> None:
 
     else:
         say("Commands:\n/status -- equity, P&L, halt state\n"
-            "/positions -- open positions\n"
+            "/positions -- open positions (with peak prices)\n"
             "/sell TICKER -- propose selling a position\n"
             "/watching -- active post watches\n"
             "/halt /resume -- stop/allow new buys\n\n"
@@ -286,7 +291,7 @@ def on_message(msg: dict, st: dict) -> None:
 
 
 def periodic(st: dict) -> None:
-    """Daily-stop bookkeeping + stop-loss watchdog. Runs every ~10 min."""
+    """Daily-stop bookkeeping + trailing-stop / take-profit watchdog (~10 min)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     eq = broker.equity()
 
@@ -294,6 +299,7 @@ def periodic(st: dict) -> None:
         st["day"] = today
         st["day_start_equity"] = eq
         st["stoploss_proposed"] = {}
+        st["tp_proposed"] = {}
         if st["halted"] and st["halt_reason"] == "daily loss stop":
             st["halted"] = False
             st["halt_reason"] = ""
@@ -308,24 +314,54 @@ def periodic(st: dict) -> None:
             f"${day0 - eq:,.2f} today. New buys halted until tomorrow "
             "(or /resume to override).")
 
-    for tk, h in broker.holdings().items():
+    holdings = broker.holdings()
+    for tk, h in holdings.items():
         try:
             avg = float(h["average_buy_price"])
             price = float(h["price"])
             qty = float(h["quantity"])
         except (KeyError, TypeError, ValueError):
             continue
-        if avg <= 0 or qty <= 0:
+        if avg <= 0 or qty <= 0 or price <= 0:
             continue
-        if (price <= avg * (1 - config.STOP_LOSS_PCT)
+
+        # High-water mark: starts at avg cost, ratchets up with price.
+        peak = max(float(st["peaks"].get(tk, avg)), price)
+        st["peaks"][tk] = peak
+        gain = (price / avg - 1) * 100
+        drop = (1 - price / peak) * 100
+
+        # TRAILING STOP -- 8% below the peak (protects gains AND principal;
+        # when the position never rose, peak ~ avg and it acts as the old
+        # fixed stop-loss).
+        if (price <= peak * (1 - config.STOP_LOSS_PCT)
                 and st["stoploss_proposed"].get(tk) != today):
-            drop = (1 - price / avg) * 100
+            kind = "TRAILING STOP" if peak > avg * 1.01 else "STOP-LOSS"
             proposals.enqueue_sell(tk, qty, [
-                f"STOP-LOSS: {tk} is down {drop:.1f}% from your "
-                f"${avg:.2f} average cost (now ${price:.2f}).",
-                f"Rule: propose exit at -{config.STOP_LOSS_PCT * 100:.0f}%.",
+                f"{kind}: {tk} is down {drop:.1f}% from its ${peak:.2f} "
+                f"high-water mark (now ${price:.2f}, {gain:+.1f}% vs your "
+                f"${avg:.2f} avg cost).",
+                f"Rule: propose exit {int(config.STOP_LOSS_PCT * 100)}% below "
+                "the peak.",
             ])
             st["stoploss_proposed"][tk] = today
+
+        # TAKE PROFIT -- up 15%+ from avg cost: sell half, let the rest ride.
+        elif (gain >= config.TAKE_PROFIT_PCT * 100
+                and st["tp_proposed"].get(tk) != today):
+            half = round(qty / 2, 4)
+            if half <= 0:
+                half = qty
+            proposals.enqueue_sell(tk, half, [
+                f"TAKE PROFIT: {tk} is up {gain:.1f}% from your ${avg:.2f} "
+                f"avg cost (now ${price:.2f}).",
+                f"Proposal: sell half ({half:g} sh) to lock in gains and let "
+                "the rest ride. Deny to keep holding everything.",
+            ])
+            st["tp_proposed"][tk] = today
+
+    # forget peaks for positions no longer held
+    st["peaks"] = {k: v for k, v in st["peaks"].items() if k in holdings}
 
 
 def check_halt_request(st: dict) -> None:
@@ -358,16 +394,16 @@ def main() -> None:
         sys.exit(str(e))
 
     st = _load_state()
-    say("\U0001F916 <b>Approver online.</b>\n"
-        "✅/❌ proposals, /help for commands -- or send an Instagram "
-        "link / $TICKERs to analyze a post.")
+    say("\U0001F916 <b>Approver online (Risk v2).</b>\n"
+        "ATR position sizing · trailing stops · take-profit proposals · "
+        "theme concentration cap.\n"
+        "✅/❌ proposals, /help for commands.")
     last_periodic = 0.0
 
     while True:
         try:
             check_halt_request(st)
 
-            # 1) queue -> Telegram
             for p in proposals.load():
                 if p["status"] == "pending":
                     if p["side"] == "buy":
@@ -390,13 +426,11 @@ def main() -> None:
                               f"⌛ Expired -- {p['ticker']} {p['side']} "
                               "proposal timed out (4h).")
 
-            # 2) periodic risk scan
             if time.time() - last_periodic > PERIODIC_EVERY:
                 periodic(st)
                 last_periodic = time.time()
                 _save_state(st)
 
-            # 3) telegram long-poll (25s -- also paces the loop)
             upd = tg("getUpdates", offset=st["offset"] + 1, timeout=25)
             for u in upd.get("result", []):
                 st["offset"] = u["update_id"]
