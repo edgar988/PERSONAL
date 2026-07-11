@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Phone-friendly web dashboard v2 -- TradingView charts, stats, market radar.
+Phone-friendly web dashboard -- TradingView charts, stats, market radar,
+dividends, social buzz.
 
 View + halt/resume only: it can NOT place orders. Orders only happen via
 Telegram approval buttons. Password from DASHBOARD_PASSWORD in .env.
@@ -28,6 +29,8 @@ _DIR = os.path.dirname(__file__)
 STATE_FILE = os.path.join(_DIR, "state.json")
 BOT_STATE_FILE = os.path.join(_DIR, "bot_state.json")
 RADAR_FILE = os.path.join(_DIR, "radar.json")
+DIV_FILE = os.path.join(_DIR, "dividends.json")
+BUZZ_FILE = os.path.join(_DIR, "buzz.json")
 HALT_REQUEST_FILE = os.path.join(_DIR, "halt_request.txt")
 
 PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
@@ -107,9 +110,9 @@ PAGE = """
       <div class='v'>${{ '%.0f' % deployed }}</div>
       <div class='l'>of ${{ caps.total }} cap</div>
       <div class='bar'><div style='width:{{ deployed_pct }}%'></div></div></div>
-    <div class='stat'><div class='l'>Positions</div>
-      <div class='v'>{{ positions|length }}</div>
-      <div class='l'>${{ caps.pos }}/position cap</div></div>
+    <div class='stat'><div class='l'>Dividend income</div>
+      <div class='v'>${{ '%.0f' % div_income }}</div>
+      <div class='l'>projected / year</div></div>
     <div class='stat'><div class='l'>Trades executed</div>
       <div class='v'>{{ trades_total }}</div>
       <div class='l'>${{ caps.stop }} daily stop</div></div>
@@ -148,6 +151,44 @@ PAGE = """
       <td class='{{ 'g' if s.verdict == 'BUY_WATCH' else ('r' if s.verdict == 'OVERBOUGHT' else 'dim') }}'>{{ s.verdict }}</td>
     </tr>{% endfor %}
   </table>{% else %}<span class='dim'>Watcher hasn't run yet.</span>{% endif %}</div>
+
+  <h2>\U0001F4B0 Dividends
+    {% if div_age %}<span class='dim'>({{ div_age }})</span>{% endif %}</h2>
+  <div class='card'>
+  {% if div_rows %}
+    <p>Projected income from holdings: <b class='g'>${{ '%.2f' % div_income }}/yr</b>
+       <span class='dim'>(~${{ '%.2f' % (div_income / 12) }}/mo)</span></p>
+    <table><tr><th>Ticker</th><th>Yield</th><th>$/share/yr</th><th>Held</th><th>Your $/yr</th><th>Ex-div</th></tr>
+    {% for d in div_rows %}<tr>
+      <td><a href='/?chart={{ d.ticker }}'><b>{{ d.ticker }}</b></a></td>
+      <td>{{ '%.1f' % d['yield'] }}%</td>
+      <td>${{ '%.2f' % d.rate }}</td>
+      <td>{{ '%g' % d.held_qty }}</td>
+      <td class='{{ 'g' if d.annual_income > 0 else 'dim' }}'>${{ '%.2f' % d.annual_income }}</td>
+      <td class='dim'>{{ d.ex_date or '-' }}</td>
+    </tr>{% endfor %}</table>
+  {% else %}<span class='dim'>Dividend tracker hasn't run yet (runs nightly).</span>{% endif %}</div>
+
+  <h2>\U0001F4AC Social buzz
+    {% if buzz_age %}<span class='dim'>({{ buzz_age }})</span>{% endif %}</h2>
+  <div class='card'>
+  {% if buzz_spikes %}
+    <p class='y'>⚠️ Mention spikes:
+    {% for s in buzz_spikes %} <b>{{ s.ticker }}</b> ({{ s.count }} vs avg {{ s.avg }}){% endfor %}
+    </p>
+  {% endif %}
+  {% if buzz_rows %}
+    <table><tr><th>Ticker</th><th>Reddit mentions</th><th>StockTwits</th></tr>
+    {% for b in buzz_rows %}<tr>
+      <td><a href='/?chart={{ b.tk }}'><b>{{ b.tk }}</b></a></td>
+      <td>{{ b.mentions }}</td>
+      <td class='dim'>{{ b.senti }}</td>
+    </tr>{% endfor %}</table>
+    {% if buzz_trending %}
+      <p class='dim'>Trending elsewhere: {{ buzz_trending }}</p>
+    {% endif %}
+    <p class='dim'>Buzz is awareness, never a buy signal.</p>
+  {% else %}<span class='dim'>Buzz monitor hasn't run yet (runs 2x daily).</span>{% endif %}</div>
 
   <h2>\U0001F4E1 Market radar
     {% if radar_age %}<span class='dim'>({{ radar_age }})</span>{% endif %}</h2>
@@ -191,7 +232,7 @@ PAGE = """
   </table>{% else %}<span class='dim'>No trades executed yet.</span>{% endif %}</div>
 
   <p class='dim'>Read-only + halt. Charts by TradingView. Data refreshes with
-  each watcher/radar run.</p>
+  each watcher/radar/buzz run.</p>
   <form method='post' action='/logout'><button>Sign out</button></form>
 
   <script src='https://s3.tradingview.com/tv.js'></script>
@@ -266,6 +307,8 @@ def index():
     bot_state = _read_json(BOT_STATE_FILE, {})
     watcher_state = _read_json(STATE_FILE, {})
     radar = _read_json(RADAR_FILE, {})
+    divs = _read_json(DIV_FILE, {})
+    buzz = _read_json(BUZZ_FILE, {})
     holdings, equity, rh_error = _holdings_safe()
 
     chart = request.args.get("chart", "")
@@ -321,6 +364,25 @@ def index():
             "size": size,
         })
 
+    # dividends -- sleeve first, then any other holding that pays
+    div_rows = sorted(divs.get("rows", []),
+                      key=lambda d: (d["ticker"] not in config.DIVIDEND_TICKERS,
+                                     -d.get("annual_income", 0)))
+
+    # social buzz
+    buzz_rows = []
+    st_map = buzz.get("stocktwits", {})
+    for tk, n in list(buzz.get("mentions", {}).items())[:8]:
+        st = st_map.get(tk)
+        senti = "-"
+        if st and (st["bull"] + st["bear"]) >= 5:
+            senti = f"{st['bull'] / (st['bull'] + st['bear']) * 100:.0f}% bullish"
+        elif st:
+            senti = f"{st['messages']} msgs"
+        buzz_rows.append({"tk": tk, "mentions": n, "senti": senti})
+    buzz_trending = ", ".join(
+        f"${tk} ({n})" for tk, n in buzz.get("trending_other", []))
+
     return render_template_string(
         PAGE, authed=True, bad=False,
         halted=bool(bot_state.get("halted")),
@@ -334,6 +396,10 @@ def index():
         signals=signals, snap_age=_age(watcher_state.get("updated")),
         sectors=radar.get("sectors", []), markets=radar.get("markets", []),
         news=radar.get("news", {}), radar_age=_age(radar.get("updated")),
+        div_rows=div_rows, div_income=divs.get("total_annual_income", 0),
+        div_age=_age(divs.get("updated")),
+        buzz_rows=buzz_rows, buzz_spikes=buzz.get("spikes", []),
+        buzz_trending=buzz_trending, buzz_age=_age(buzz.get("updated")),
         positions=positions, pending=pending,
         trades=trades, trades_total=len(all_trades))
 

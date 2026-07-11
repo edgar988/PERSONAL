@@ -63,4 +63,3 @@ BIG_MOVE_PCT = 3.0   # alert when a ticker is up/down this % on the day
 BUZZ_SUBREDDITS = ["wallstreetbets", "stocks", "investing"]
 BUZZ_SPIKE_MULT = 3.0   # mentions >= 3x recent average = spike
 BUZZ_SPIKE_MIN  = 5     # ...and at least this many mentions
-""""""
