@@ -1,13 +1,13 @@
 """
-Trading bot configuration -- Stage 1 (Watcher).
+Trading bot configuration.
 
 NO SECRETS IN THIS FILE. Telegram credentials come from environment
 variables / the .env file (see .env.example). This file is safe to commit.
 """
 
 # -- Watchlist ---------------------------------------------------------------
-# 16 liquid large-caps across sectors, tilted toward the AI-infrastructure
-# "picks and shovels" theme. Edit freely -- one ticker per line.
+# Liquid large-caps across sectors, tilted toward the AI-infrastructure
+# "picks and shovels" theme, plus a dividend-income sleeve. Edit freely.
 WATCHLIST = [
     # Ballast (steady, lower-risk)
     "SPY",    # S&P 500 ETF -- the whole market, your anchor
@@ -31,11 +31,16 @@ WATCHLIST = [
     "FCX",    # Freeport-McMoRan -- copper (the wire)
     "CLF",    # Cleveland-Cliffs -- sole US maker of transformer-core steel
     "NUE",    # Nucor -- steel + data-center racking
+    # Dividend-income sleeve
+    "SCHD",   # Schwab US Dividend Equity ETF -- dividend growth
+    "JEPI",   # JPMorgan Equity Premium Income -- covered-call income ETF
+    "O",      # Realty Income -- pays MONTHLY
 ]
 
+# The income sleeve, tracked by the dividend module.
+DIVIDEND_TICKERS = ["SCHD", "JEPI", "O"]
+
 # -- Risk caps (the brakes) --------------------------------------------------
-# NOT used in Stage 1 (the Watcher places zero trades) but defined here so
-# Stage 2 (approve-first execution) inherits them with no code changes.
 ACCOUNT_SIZE_USD       = 5000    # your Robinhood starting balance
 MAX_PER_POSITION_USD   = 500     # most the bot may put into any single stock
 MAX_TOTAL_DEPLOYED_USD = 3000    # most it may ever have in play at once
@@ -43,7 +48,6 @@ DAILY_LOSS_STOP_USD    = 150     # if down this much in a day, stop trading
 STOP_LOSS_PCT          = 0.08    # suggested exit ~8% below entry
 
 # -- Strategy parameters -----------------------------------------------------
-# Transparent swing-trading rules. Tune these as you learn what you like.
 FAST_SMA   = 20     # short moving average (days)
 SLOW_SMA   = 50     # long / trend moving average (days)
 RSI_PERIOD = 14     # RSI lookback (days)
@@ -53,7 +57,10 @@ LOOKBACK_DAYS     = 200  # how much price history to pull for the math
 CROSS_RECENT_DAYS = 3    # a crossover counts as "fresh" if within this many days
 
 # -- Intraday scan -----------------------------------------------------------
-# The `scan` mode runs every 30 min during market hours and stays SILENT
-# unless something changed. A big intraday move (vs yesterday's close)
-# triggers a one-time alert per ticker per day.
 BIG_MOVE_PCT = 3.0   # alert when a ticker is up/down this % on the day
+
+# -- Social buzz -------------------------------------------------------------
+BUZZ_SUBREDDITS = ["wallstreetbets", "stocks", "investing"]
+BUZZ_SPIKE_MULT = 3.0   # mentions >= 3x recent average = spike
+BUZZ_SPIKE_MIN  = 5     # ...and at least this many mentions
+""""""
