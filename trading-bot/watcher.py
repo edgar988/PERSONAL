@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
-Stage 1 -- THE WATCHER.
-
-Two modes, both cron-friendly:
+THE WATCHER.
 
   python watcher.py           Full digest -- every ticker, sent every time.
-                              Run once daily after market close.
-
-  python watcher.py scan      Quiet intraday scan -- run every 30 min during
-                              market hours. Sends a message ONLY when:
-                                * a ticker newly turns BUY_WATCH, or
-                                * a ticker moves +/-BIG_MOVE_PCT% on the day
-                                  (one alert per ticker per day).
-                              Otherwise: total silence.
-
+  python watcher.py scan      Quiet intraday scan (every 30 min via cron).
+                              Speaks only on: fresh BUY_WATCH, +/-3% day
+                              moves, or unusual volume (>= 2.5x average).
   python watcher.py test      Telegram self-test.
 
-Stage 2 integration: every fresh BUY_WATCH also lands in the proposal queue.
-If the approver bot is running, it follows up with ✅/❌ buttons; nothing is
-placed without a tap. If the approver bot is NOT running, the queue entry
-just sits there and expires -- the Watcher itself never trades.
+Stage 2 integration: every fresh BUY_WATCH lands in the proposal queue,
+sized by volatility (ATR): calm names get up to $500, wild ones get less,
+so every position carries roughly equal risk. Nothing is placed without
+a ✅ tap in Telegram.
 """
 from __future__ import annotations
 
@@ -29,7 +21,6 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Load .env (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID) if python-dotenv is installed.
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -50,10 +41,11 @@ def _load_state() -> dict:
         with open(STATE_FILE) as fh:
             raw = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"verdicts": {}, "move_alerts": {}}
+        raw = {}
     if "verdicts" not in raw:  # migrate old flat format
-        return {"verdicts": raw, "move_alerts": {}}
+        raw = {"verdicts": raw} if raw else {"verdicts": {}}
     raw.setdefault("move_alerts", {})
+    raw.setdefault("vol_alerts", {})
     return raw
 
 
@@ -83,11 +75,27 @@ def _fresh_buys(signals, state):
             and state["verdicts"].get(s.ticker) != "BUY_WATCH"]
 
 
+def _position_dollars(s) -> int:
+    """Volatility-scaled position size: equal risk, not equal dollars."""
+    if s.atr_pct <= 0:
+        return int(config.MAX_PER_POSITION_USD)
+    scale = min(1.0, config.ATR_BASELINE_PCT / s.atr_pct)
+    dollars = int(round(config.MAX_PER_POSITION_USD * scale / 10) * 10)
+    return max(config.MIN_POSITION_USD,
+               min(dollars, config.MAX_PER_POSITION_USD))
+
+
 def _queue_for_approval(s) -> None:
     """Stage 2 hand-off: put the signal in the proposal queue."""
     try:
-        proposals.enqueue_buy(s.ticker, s.price,
-                              config.MAX_PER_POSITION_USD, s.reasons)
+        dollars = _position_dollars(s)
+        reasons = list(s.reasons)
+        if dollars < config.MAX_PER_POSITION_USD:
+            reasons.append(
+                f"Position sized ${dollars} (not ${config.MAX_PER_POSITION_USD}) "
+                f"because {s.ticker} moves ~{s.atr_pct:.1f}%/day vs the "
+                f"{config.ATR_BASELINE_PCT:.0f}% baseline -- equal risk sizing.")
+        proposals.enqueue_buy(s.ticker, s.price, dollars, reasons)
     except Exception as e:  # queueing must never break the watcher
         print(f"[watcher] could not enqueue {s.ticker}: {e}")
 
@@ -96,7 +104,8 @@ def _send_buy_detail(s) -> None:
     detail = [f"\U0001F7E2 <b>{s.ticker}</b> -- buy-watch triggered",
               f"Price: ${s.price:.2f}",
               f"{config.FAST_SMA}d avg: ${s.sma_fast:.2f} | "
-              f"{config.SLOW_SMA}d avg: ${s.sma_slow:.2f} | RSI: {s.rsi:.0f}",
+              f"{config.SLOW_SMA}d avg: ${s.sma_slow:.2f} | RSI: {s.rsi:.0f} | "
+              f"ATR {s.atr_pct:.1f}%/day",
               "", "<b>Why:</b>"]
     detail += [f"* {r}" for r in s.reasons]
     detail.append("")
@@ -110,7 +119,9 @@ def _update_state(state, signals) -> None:
     state["snapshot"] = {
         s.ticker: {"price": round(s.price, 2),
                    "rsi": round(s.rsi),
-                   "chg": round(s.day_change_pct, 2)}
+                   "chg": round(s.day_change_pct, 2),
+                   "atr": round(s.atr_pct, 2),
+                   "vol": round(s.vol_ratio, 2)}
         for s in signals
     }
     state["updated"] = time.time()
@@ -146,8 +157,10 @@ def digest() -> None:
     lines.append("<b>Full board:</b>")
     for s in sorted(signals, key=lambda x: x.verdict):
         arrow = "↑" if s.day_change_pct >= 0 else "↓"
+        vol_note = f" ⚡{s.vol_ratio:.1f}x vol" if s.vol_ratio >= config.VOLUME_SPIKE_MULT else ""
         lines.append(f"{_icon(s.verdict)} {s.ticker} ${s.price:.2f} "
-                     f"{arrow}{abs(s.day_change_pct):.1f}% (RSI {s.rsi:.0f})")
+                     f"{arrow}{abs(s.day_change_pct):.1f}% (RSI {s.rsi:.0f})"
+                     f"{vol_note}")
     notify.send("\n".join(lines))
 
     for s in fresh:
@@ -169,10 +182,14 @@ def scan() -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fresh = _fresh_buys(signals, state)
 
-    # Big intraday movers -- one alert per ticker per day
     movers = [s for s in signals
               if abs(s.day_change_pct) >= config.BIG_MOVE_PCT
               and state["move_alerts"].get(s.ticker) != today]
+
+    # Unusual volume: someone big is active (free order-flow proxy).
+    vol_spikes = [s for s in signals
+                  if s.vol_ratio >= config.VOLUME_SPIKE_MULT
+                  and state["vol_alerts"].get(s.ticker) != today]
 
     for s in fresh:
         _send_buy_detail(s)
@@ -190,10 +207,21 @@ def scan() -> None:
         lines.append("<i>Heads-up only -- no trades placed.</i>")
         notify.send("\n".join(lines))
 
+    if vol_spikes:
+        lines = ["<b>\U0001F50A Unusual volume (institutional radar):</b>"]
+        for s in vol_spikes:
+            lines.append(f"<b>{s.ticker}</b> trading at {s.vol_ratio:.1f}x its "
+                         f"normal volume ({s.day_change_pct:+.1f}% today, "
+                         f"${s.price:.2f})")
+            state["vol_alerts"][s.ticker] = today
+        lines.append("")
+        lines.append("<i>Big volume = big players active. Check the chart and "
+                     "news before reacting -- this is awareness, not a signal.</i>")
+        notify.send("\n".join(lines))
+
     _update_state(state, signals)
     print(f"[watcher] scan: {len(signals)} tickers, {len(fresh)} fresh buys, "
-          f"{len(movers)} big movers. "
-          + ("(quiet -- nothing new)" if not fresh and not movers else ""))
+          f"{len(movers)} movers, {len(vol_spikes)} volume spikes.")
 
 
 if __name__ == "__main__":

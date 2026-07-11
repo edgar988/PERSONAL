@@ -1,14 +1,12 @@
 """
-Transparent swing-trading signal logic.
-
-The whole point of Stage 1 is that you can READ why the bot likes a stock.
-Nothing here is a black box:
+Transparent swing-trading signal logic. Nothing here is a black box:
 
   * Trend filter  -- is price above its 50-day average? (only buy uptrends)
-  * Entry trigger -- did the 20-day average just cross above the 50-day
-                     (fresh momentum), OR did RSI just climb back out of
-                     oversold territory (a bounce)?
-  * Caution       -- is RSI above 70 (stretched / take-profit zone)?
+  * Entry trigger -- 20-day avg crossing above 50-day (fresh momentum), OR
+                     RSI climbing back out of oversold (a bounce)
+  * Caution       -- RSI above 70 (stretched / take-profit zone)
+  * ATR           -- average daily range %, used for position sizing
+  * Volume ratio  -- today's volume vs 20-day average (institutional radar)
 """
 from __future__ import annotations
 
@@ -29,10 +27,11 @@ class Signal:
     rsi: float
     verdict: str        # "BUY_WATCH" | "OVERBOUGHT" | "NEUTRAL"
     reasons: list = field(default_factory=list)
+    atr_pct: float = 0.0    # avg daily true range as % of price
+    vol_ratio: float = 0.0  # today's volume / 20-day avg volume
 
     @property
     def day_change_pct(self) -> float:
-        """Percent move vs the prior close (intraday move detector)."""
         if self.prev_close <= 0:
             return 0.0
         return (self.price - self.prev_close) / self.prev_close * 100.0
@@ -46,6 +45,32 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0.0, 1e-9)
     return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _atr_pct(df, price: float) -> float:
+    """Average True Range over ATR_PERIOD days, as % of current price."""
+    try:
+        high, low, close = df["High"], df["Low"], df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([high - low,
+                        (high - prev_close).abs(),
+                        (low - prev_close).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(config.ATR_PERIOD).mean().iloc[-1])
+        return (atr / price * 100.0) if price > 0 else 0.0
+    except (KeyError, TypeError, ValueError, IndexError):
+        return 0.0
+
+
+def _vol_ratio(df) -> float:
+    """Today's volume vs its trailing 20-day average."""
+    try:
+        vol = df["Volume"].dropna()
+        if len(vol) < 22:
+            return 0.0
+        avg = float(vol.iloc[-21:-1].mean())
+        return float(vol.iloc[-1]) / avg if avg > 0 else 0.0
+    except (KeyError, TypeError, ValueError):
+        return 0.0
 
 
 def evaluate(ticker: str, df):
@@ -64,7 +89,6 @@ def evaluate(ticker: str, df):
 
     reasons = []
 
-    # Trend filter
     trend_up = price > s
     reasons.append(
         f"Price ${price:.2f} is {'above' if trend_up else 'below'} "
@@ -72,7 +96,6 @@ def evaluate(ticker: str, df):
         f"({'uptrend' if trend_up else 'downtrend'})"
     )
 
-    # Fresh 20/50 crossover within the last CROSS_RECENT_DAYS?
     fresh_cross = False
     for i in range(1, config.CROSS_RECENT_DAYS + 1):
         if (
@@ -87,7 +110,6 @@ def evaluate(ticker: str, df):
             f"{config.SLOW_SMA}-day avg (fresh momentum)"
         )
 
-    # RSI climbing back out of oversold?
     rsi_recovering = (
         r > config.RSI_OVERSOLD and float(rsi.iloc[-2]) <= config.RSI_OVERSOLD
     )
@@ -99,7 +121,6 @@ def evaluate(ticker: str, df):
 
     reasons.append(f"RSI is {r:.0f}")
 
-    # Verdict
     if r >= config.RSI_OVERBOUGHT:
         verdict = "OVERBOUGHT"
         reasons.append(
@@ -110,4 +131,5 @@ def evaluate(ticker: str, df):
     else:
         verdict = "NEUTRAL"
 
-    return Signal(ticker, price, prev_close, f, s, r, verdict, reasons)
+    return Signal(ticker, price, prev_close, f, s, r, verdict, reasons,
+                  atr_pct=_atr_pct(df, price), vol_ratio=_vol_ratio(df))
