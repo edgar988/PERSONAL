@@ -8,6 +8,7 @@ dashboard reuse headlessly. You may be asked to approve the login in your
 Robinhood phone app (device approval) -- keep your phone handy.
 """
 import getpass
+import os
 
 import robin_stocks.robinhood as rh
 
@@ -19,4 +20,10 @@ rh.login(username, password, store_session=True)
 
 bp = rh.profiles.load_account_profile(info="buying_power")
 print(f"\nLogin OK. Buying power: ${bp}")
-print("Session stored. The approver bot and dashboard can now trade headlessly.")
+
+# clear the one-alert-per-failure flag so the bot alerts again next time
+try:
+    os.remove(os.path.join(os.path.dirname(__file__), "login_failed.flag"))
+except OSError:
+    pass
+print("Session stored. Restart the bot: systemctl start tradingbot-approver")
