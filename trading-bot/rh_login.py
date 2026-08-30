@@ -26,4 +26,5 @@ try:
     os.remove(os.path.join(os.path.dirname(__file__), "login_failed.flag"))
 except OSError:
     pass
-print("Session stored. Restart the bot: systemctl start tradingbot-approver")
+print("Session stored. The approver picks it up by itself within 5 min "
+      "(or: systemctl restart tradingbot-approver to hurry it along).")

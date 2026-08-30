@@ -45,6 +45,8 @@ STATE_FILE = os.path.join(_DIR, "bot_state.json")
 HALT_REQUEST_FILE = os.path.join(_DIR, "halt_request.txt")  # dashboard -> bot
 PROPOSAL_TTL = 4 * 3600
 PERIODIC_EVERY = 600
+SESSION_RETRY_EVERY = 300          # re-check Robinhood login while paused
+SESSION_REMINDER_EVERY = 12 * 3600  # nag again if still logged out
 
 
 def _load_state() -> dict:
@@ -384,14 +386,38 @@ def check_halt_request(st: dict) -> None:
         say("▶️ Resumed from the dashboard.")
 
 
+def wait_for_session() -> None:
+    """Block until the stored Robinhood session works.
+
+    broker.ensure_login already sends ONE Telegram alert per failure streak;
+    this loop keeps the process alive (so systemd doesn't restart-and-re-alert
+    every 2 min), nags every 12h, and resumes by itself once rh_login.py has
+    been run -- no service restart needed."""
+    paused_at = None
+    last_reminder = None
+    while True:
+        ok, reason = broker.session_ok()
+        if ok:
+            if paused_at is not None:
+                say("✅ <b>Robinhood session restored</b> -- approver resuming.")
+            return
+        now = time.time()
+        if paused_at is None:
+            paused_at = last_reminder = now
+        elif now - last_reminder > SESSION_REMINDER_EVERY:
+            hrs = int((now - paused_at) // 3600)
+            say(f"⚠️ <b>Approver still paused ({hrs}h)</b> -- Robinhood "
+                "login needed.\n<code>cd ~/personal/trading-bot && "
+                "~/.tradingbot-venv/bin/python rh_login.py</code>")
+            last_reminder = now
+        print(f"[bot] waiting for Robinhood session: {reason}")
+        time.sleep(SESSION_RETRY_EVERY)
+
+
 def main() -> None:
     if not TOKEN or not CHAT_ID:
         sys.exit("Set TELEGRAM_TOKEN / TELEGRAM_CHAT_ID in .env")
-    try:
-        broker.ensure_login()
-    except Exception as e:
-        say(f"⚠️ Approver bot can't start: {e}")
-        sys.exit(str(e))
+    wait_for_session()
 
     st = _load_state()
     say("\U0001F916 <b>Approver online (Risk v2).</b>\n"
@@ -426,7 +452,10 @@ def main() -> None:
                               f"⌛ Expired -- {p['ticker']} {p['side']} "
                               "proposal timed out (4h).")
 
+            # Re-validate the session first so a token that expires mid-run
+            # pauses cleanly instead of every broker call failing in a loop.
             if time.time() - last_periodic > PERIODIC_EVERY:
+                wait_for_session()
                 periodic(st)
                 last_periodic = time.time()
                 _save_state(st)
